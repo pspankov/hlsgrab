@@ -86,3 +86,8 @@ to `<list>.failed`. Run `head -40 batch_m3u8.sh` for the full reference.
 ## Legal
 
 Only download content you have the right to download. Respect the terms of the sites you use this with.
+You are solely responsible for how you use this software.
+
+## License
+
+[MIT](LICENSE). Free to use, modify and distribute; provided "as is", without warranty or liability of any kind.
