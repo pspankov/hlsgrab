@@ -21,9 +21,9 @@ RUN printf '#!/bin/sh\nexec google-chrome-stable --no-sandbox --disable-dev-shm-
  && chmod 755 /usr/local/bin/chrome
 
 WORKDIR /app
-COPY batch_m3u8.sh server.mjs entrypoint.sh ./
+COPY batch_m3u8.sh server.mjs entrypoint.sh start.sh ./
 COPY public ./public
-RUN chmod 755 batch_m3u8.sh entrypoint.sh \
+RUN chmod 755 batch_m3u8.sh entrypoint.sh start.sh \
  && ln -s /app/batch_m3u8.sh /usr/local/bin/batch_m3u8 \
  && mkdir -p /data /downloads && chown node:node /data /downloads
 
@@ -33,9 +33,11 @@ ENV CHROME=/usr/local/bin/chrome \
     PORT=8090 \
     DISPLAY=:99 \
     XDG_CACHE_HOME=/tmp/.cache \
-    HOME=/tmp
+    HOME=/tmp \
+    PUID=1000 \
+    PGID=1000
 
-USER node
+# Starts as root only to fix ownership of the mounted folders, then drops to PUID:PGID (see entrypoint.sh).
 EXPOSE 8090
 VOLUME ["/data", "/downloads"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/api/state" -u "${AUTH:-x:x}" || exit 1

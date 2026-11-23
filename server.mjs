@@ -32,10 +32,18 @@ try { state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) }; 
 for (const j of state.jobs) {
   if (j.status === "running") Object.assign(j, { status: "failed", error: "interrupted (server stopped unexpectedly)", finishedAt: Date.now() });
 }
+let lastSaveError = "";
 const writeState = () => {
-  const tmp = STATE_FILE + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(state));
-  fs.renameSync(tmp, STATE_FILE);
+  try {
+    const tmp = STATE_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(state));
+    fs.renameSync(tmp, STATE_FILE);
+    lastSaveError = "";
+  } catch (e) {
+    // Don't crash the server over it (jobs keep running); log each distinct problem once.
+    if (e.message !== lastSaveError) console.error(`cannot save job list to ${STATE_FILE}: ${e.message}`);
+    lastSaveError = e.message;
+  }
 };
 let saveTimer;
 const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(writeState, 300); };

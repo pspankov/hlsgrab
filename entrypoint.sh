@@ -1,9 +1,22 @@
 #!/bin/sh
-# Start a virtual X display for headful Chrome, then the web server.
+# Runs as root only long enough to make the mounted folders writable, then drops to PUID:PGID.
+# (Docker creates missing bind-mount folders as root, which the app user can't write to.)
 set -e
-rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
-Xvfb "${DISPLAY:-:99}" -screen 0 1280x800x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
-i=0
-while [ ! -e "/tmp/.X11-unix/X${DISPLAY#:}" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-[ -e "/tmp/.X11-unix/X${DISPLAY#:}" ] || { echo "Xvfb did not start:"; cat /tmp/xvfb.log; exit 1; }
-exec node /app/server.mjs
+PUID=${PUID:-1000}
+PGID=${PGID:-1000}
+
+if [ "$(id -u)" = 0 ]; then
+  for d in "$DATA_DIR" "$DOWNLOADS_DIR"; do
+    mkdir -p "$d"
+    owner=$(stat -c %u "$d")
+    if [ "$owner" = 0 ]; then
+      chown "$PUID:$PGID" "$d"   # only the folder itself; files inside are left alone
+      echo "hlsgrab: $d was owned by root, handed it to $PUID:$PGID"
+    elif [ "$owner" != "$PUID" ]; then
+      echo "hlsgrab: warning: $d is owned by uid $owner but the app runs as $PUID (set PUID/PGID to match)"
+    fi
+  done
+  exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups /app/start.sh
+fi
+
+exec /app/start.sh   # already started as a non-root user (e.g. compose `user:`)

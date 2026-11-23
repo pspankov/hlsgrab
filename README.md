@@ -24,7 +24,6 @@ tool**. Both run the same script.
 
 ```bash
 git clone <this repo> hlsgrab && cd hlsgrab
-mkdir -p downloads data          # create them yourself so they're owned by you, not root
 docker compose up -d --build     # → http://localhost:8090
 ```
 
@@ -50,6 +49,7 @@ In the UI:
 | `DATA_DIR` | `/data` | job list `jobs.json` (mounted from `./data`) |
 | `CONCURRENCY` | `1` | downloads at a time |
 | `AUTH` | empty | `user:password` enables a login (compose reads it from `HLSGRAB_AUTH`) |
+| `PUID` / `PGID` | `1000` | user/group the app runs as and owns new files; set to `$(id -u)` / `$(id -g)` if yours differ |
 | `PORT` | `8090` | port inside the container |
 
 Chrome runs **headful** on a virtual display (Xvfb) inside the container, because many sites block headless
