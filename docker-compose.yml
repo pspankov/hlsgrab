@@ -16,6 +16,7 @@ services:
       PGID: ${PGID:-1000}
       CONCURRENCY: "1"         # downloads at a time
       AUTH: ${HLSGRAB_AUTH:-}  # "user:password" to require a login; empty = no login
+      LIBRARY_SIDECARS: ${HLSGRAB_LIBRARY_SIDECARS:-0}  # 1 = "Add to library" fields + <file>.hlsgrab.json for an importer
     volumes:
       - ./downloads:/downloads
       - ./data:/data
