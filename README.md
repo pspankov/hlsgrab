@@ -16,6 +16,8 @@ tool**. Both run the same script.
   `.js` / `.css` / `.woff`.
 - **Segment host check**: probes one real segment per host first; dead hosts are rerouted to a live mirror
   that is verified to serve the same segment.
+- **Unwraps disguised segments**: MPEG-TS segments served behind an image header (e.g. a 1×1 PNG on an image
+  CDN) are detected and stripped on the fly through a local proxy, then downloaded with ffmpeg (stream copy).
 - **Batch + resume**: a list of page URLs, one at a time, resumable from any position.
 - Blocks the `disable-devtool` anti-DevTools script; tries to start the player if it waits for a click.
 - Files are named after the last part of the page URL: `https://site.com/show/episode-1/` → `episode-1.mp4`.
