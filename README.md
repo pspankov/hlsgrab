@@ -51,6 +51,26 @@ In the UI:
 | `AUTH` | empty | `user:password` enables a login (compose reads it from `HLSGRAB_AUTH`) |
 | `PUID` / `PGID` | `1000` | user/group the app runs as and owns new files; set to `$(id -u)` / `$(id -g)` if yours differ |
 | `PORT` | `8090` | port inside the container |
+| `LIBRARY_SIDECARS` | `0` | `1` shows **Add to library** and writes a sidecar file per download (see below); compose reads it from `HLSGRAB_LIBRARY_SIDECARS` |
+
+### Library sidecars (for Radarr / Sonarr importers)
+
+With `LIBRARY_SIDECARS=1`, a job can say what it downloads: **movie** or **series episode(s)**, an id
+(`tmdb:22586`, `tvdb:174681`, `imdb:tt0110943`, a bare number = TMDB for movies / TVDB for series, or a Seerr /
+TMDB link) and the audio language. For series, the season and episode come from each URL (`…-1x18`, `…-s01e18`,
+`…-s02e36-e40`) unless you set them, so one target can cover a whole list of episode URLs. URLs whose episode
+can't be determined are rejected when queued.
+
+When such a job finishes, hlsgrab writes `<file>.hlsgrab.json` next to the video (atomically, only on success):
+
+```json
+{ "version": 1, "file": "ben-10-2016-1x18.mp4", "type": "series", "idSource": "tvdb", "id": 318145,
+  "language": "bul", "season": 1, "episodes": [18], "sourceUrl": "https://…", "jobId": "…", "finishedAt": 1795… }
+```
+
+hlsgrab itself never contacts Radarr or Sonarr and needs no API keys: an importer running elsewhere watches the
+downloads folder, imports the video and removes the sidecar. That keeps the browser container, which opens
+untrusted pages, away from credentials that can run code on your media server.
 
 Chrome runs **headful** on a virtual display (Xvfb) inside the container, because many sites block headless
 Chrome.

@@ -30,6 +30,7 @@
     --run: #8a9cff; --run-soft: #232b4d; --idle: #9aa1b2; --idle-soft: #242936; --track: #262b3a; --code: #10131b;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; }
   body {
     background: radial-gradient(1200px 400px at 50% -100px, var(--bg-glow), transparent), var(--bg);
@@ -182,6 +183,47 @@
       </div>
     </details>
 
+    <details class="adv" id="libBox" hidden>
+      <summary>Add to library <span id="libSummary" class="hint" style="margin:0 0 0 6px"></span></summary>
+      <div class="adv-body">
+        <div class="hint" style="margin:0">After a successful download, a <code>.hlsgrab.json</code> file next to the video tells your importer what it is (e.g. to import it into Radarr / Sonarr).</div>
+        <div class="grid">
+          <div class="opt">
+            <label for="libType">Type</label>
+            <select id="libType">
+              <option value="">Not for the library</option>
+              <option value="movie">Movie</option>
+              <option value="series">Series episode(s)</option>
+            </select>
+          </div>
+          <div class="opt" id="libIdOpt">
+            <label for="libId">ID or link</label>
+            <input type="text" id="libId" placeholder="tmdb:22586 · tvdb:174681 · Seerr link" spellcheck="false">
+            <div class="note">A bare number is TMDB for movies, TVDB for series. Seerr and TMDB links work for both.</div>
+          </div>
+          <div class="opt" id="libLangOpt">
+            <label for="libLang">Audio language</label>
+            <select id="libLang">
+              <option value="bul">Bulgarian</option>
+              <option value="eng">English</option>
+              <option value="und">Unknown</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid" id="libSeriesFields">
+          <div class="opt">
+            <label for="libSeason">Season</label>
+            <input type="number" id="libSeason" min="0" max="999" placeholder="from URL">
+          </div>
+          <div class="opt">
+            <label for="libEpisode">Episode</label>
+            <input type="text" id="libEpisode" placeholder="from URL · 18 · 36-40" spellcheck="false">
+            <div class="note">Left empty, each URL's <code>1x18</code> / <code>s01e18</code> / <code>s02e36-e40</code> is used. Set it only for a single URL.</div>
+          </div>
+        </div>
+      </div>
+    </details>
+
     <div class="actions">
       <button class="btn primary" id="startBtn">Start download</button>
       <button class="btn" id="probeBtn" title="Open the first page and show the stream it finds, without downloading">Find stream only</button>
@@ -275,6 +317,29 @@ for (const id of ["downloader", "timeout", "hostCheck"]) {
 if (store.get("mode") === "direct") setMode("direct");
 
 const options = () => ({ downloader: $("#downloader").value, timeout: Number($("#timeout").value) || 30, hostCheck: $("#hostCheck").checked });
+
+// ---------- library target (only when the server runs with LIBRARY_SIDECARS=1) ----------
+for (const id of ["libType", "libLang"]) {
+  const el = $("#" + id), v = store.get("lib." + id);
+  if (v !== null) el.value = v;
+  el.addEventListener("change", () => { store.set("lib." + id, el.value); libUi(); });
+}
+["libId", "libSeason", "libEpisode"].forEach((id) => $("#" + id).addEventListener("input", libUi));
+function libUi() {
+  const t = $("#libType").value;
+  $("#libIdOpt").hidden = $("#libLangOpt").hidden = !t;
+  $("#libSeriesFields").hidden = t !== "series";
+  const id = $("#libId").value.trim();
+  $("#libSummary").textContent = !t ? "" : `· ${t}${id ? " " + (id.length > 40 ? id.slice(0, 40) + "…" : id) : " (needs an id)"}`;
+}
+libUi();
+const library = () => {
+  if ($("#libBox").hidden || !$("#libType").value) return null;
+  return { type: $("#libType").value, id: $("#libId").value.trim(), language: $("#libLang").value,
+           season: $("#libSeason").value, episode: $("#libEpisode").value.trim() };
+};
+const libLabel = (l) => !l ? "" : l.type === "movie" ? `movie ${l.idSource}:${l.id}`
+  : `series ${l.idSource}:${l.id} S${String(l.season).padStart(2, "0")}E${l.episodes.map((e) => String(e).padStart(2, "0")).join("-E")}`;
 function flash(msg, kind = "ok") { const f = $("#flash"); f.className = "flash " + kind; f.textContent = msg; clearTimeout(flash.t); flash.t = setTimeout(() => (f.textContent = ""), 7000); }
 
 async function start() {
@@ -283,13 +348,16 @@ async function start() {
   $("#startBtn").disabled = true;
   try {
     const body = mode === "direct"
-      ? { mode, url: text.split(/\s+/)[0], referer: $("#referer").value, name: $("#name").value, options: options() }
-      : { mode, urls: text, options: options() };
+      ? { mode, url: text.split(/\s+/)[0], referer: $("#referer").value, name: $("#name").value, options: options(), library: library() }
+      : { mode, urls: text, options: options(), library: library() };
     const r = await api("/api/jobs", { method: "POST", body });
-    if (r.created.length) { urls.value = ""; autoGrow(); if (mode === "direct") $("#name").value = ""; }
+    if (r.created.length) {
+      urls.value = ""; autoGrow(); if (mode === "direct") $("#name").value = "";
+      $("#libSeason").value = $("#libEpisode").value = ""; libUi();   // per-title fields; type and language stay
+    }
     const parts = [];
     if (r.created.length) parts.push(`Queued ${r.created.length} job${r.created.length > 1 ? "s" : ""}.`);
-    if (r.rejected.length) parts.push(`Skipped ${r.rejected.length} line${r.rejected.length > 1 ? "s" : ""} that aren't http(s) URLs: ${r.rejected.slice(0, 3).join(", ")}${r.rejected.length > 3 ? "…" : ""}`);
+    if (r.rejected.length) parts.push(`Skipped ${r.rejected.length}: ${r.rejected.slice(0, 3).join("; ")}${r.rejected.length > 3 ? "…" : ""}`);
     flash(parts.join(" "), r.rejected.length ? "err" : "ok");
     refresh();
   } catch (e) { flash(e.message, "err"); }
@@ -327,7 +395,8 @@ $("#probeBtn").onclick = async () => {
       <div class="actions" style="margin-top:12px"><button class="btn small primary" id="probeQueue">Download this stream</button></div>`;
     $("#probeQueue").onclick = async () => {
       const slug = (() => { try { return new URL(first).pathname.split("/").filter(Boolean).pop() || ""; } catch { return ""; } })();
-      await api("/api/jobs", { method: "POST", body: { mode: "direct", url: x.url, referer: x.referer || "", name: slug, options: options() } });
+      const r = await api("/api/jobs", { method: "POST", body: { mode: "direct", url: x.url, referer: x.referer || "", name: slug, options: options(), library: library() } });
+      if (r.rejected.length) { flash(`Not queued: ${r.rejected[0]}`, "err"); return; }
       flash("Queued the found stream."); out.className = "probe-out"; refresh();
     };
   } catch (e) { out.innerHTML = `<div class="job-err">${esc(e.message)}</div>`; }
@@ -355,6 +424,7 @@ function jobHtml(j) {
   const meta = [];
   meta.push(`<span>${j.kind === "direct" ? "direct stream" : "page"} · <a href="${esc(j.url)}" target="_blank" rel="noopener noreferrer" style="color:inherit">${esc(j.url)}</a></span>`);
   if (j.kind === "page" && j.m3u8) meta.push(`<span>stream: <code>${esc(j.m3u8)}</code></span>`);
+  if (j.library) meta.push(`<span>library: ${esc(libLabel(j.library))} · ${esc(j.library.language)}</span>`);
   if (j.tool) meta.push(`<span>tool: ${esc(j.tool)}</span>`);
   if (j.hosts) meta.push(`<span>hosts: ${esc(j.hosts)}</span>`);
   if (j.startedAt && j.finishedAt && j.status !== "queued") meta.push(`<span>took ${fmtDur(j.finishedAt - j.startedAt)}</span>`);
@@ -457,6 +527,7 @@ async function refresh() {
     const s = await api("/api/state");
     const doneBefore = lastState ? lastState.jobs.filter((j) => j.status === "done").length : -1;
     lastState = s;
+    $("#libBox").hidden = !s.library;
     renderJobs(s);
     if (s.jobs.filter((j) => j.status === "done").length !== doneBefore) refreshFiles();
   } catch {}

@@ -3,6 +3,8 @@
 //
 // env: PORT (8090)  HOST (0.0.0.0)  DATA_DIR (./data)  DOWNLOADS_DIR ($DATA_DIR/downloads)
 //      SCRIPT (./batch_m3u8.sh)  CONCURRENCY (1)  AUTH ("user:pass" enables HTTP basic auth)
+//      LIBRARY_SIDECARS (off) "1" = jobs can carry a library target (movie/series id, season/episode, language);
+//                       a finished job then writes <file>.hlsgrab.json next to the video for an external importer.
 import http from "node:http";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -19,6 +21,7 @@ const DOWNLOADS_DIR = path.resolve(process.env.DOWNLOADS_DIR || path.join(DATA_D
 const SCRIPT = process.env.SCRIPT || path.join(HERE, "batch_m3u8.sh");
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
 const AUTH = process.env.AUTH || "";
+const LIBRARY = /^(1|true|yes|on)$/i.test(process.env.LIBRARY_SIDECARS || "");
 const LOG_LINES = 600;
 const INDEX_HTML = path.join(HERE, "public", "index.html");
 
@@ -60,6 +63,84 @@ const cleanOptions = (o = {}) => ({
 });
 const isHttpUrl = (u) => { try { return ["http:", "https:"].includes(new URL(u).protocol); } catch { return false; } };
 const cleanName = (n = "") => String(n).trim().replace(/[\/\\\0]/g, "_").replace(/^\.+/, "").slice(0, 200);
+
+// ---------------- library target (LIBRARY_SIDECARS) ----------------
+// A job may say what it is: a movie or a series episode, identified by TMDB/TVDB/IMDb id. hlsgrab doesn't talk to
+// Radarr/Sonarr itself; it only writes this as a sidecar file, so the container needs no API keys.
+const LANGS = ["bul", "eng", "und"];
+const MAX_EPISODES = 20;
+
+// "36" | "36-40" | "36-e40" -> [36, ..., 40]
+function parseEpisodes(s) {
+  const m = /^\s*(\d{1,4})\s*(?:-\s*e?(\d{1,4}))?\s*$/i.exec(String(s ?? ""));
+  if (!m) return null;
+  const a = Number(m[1]), b = m[2] ? Number(m[2]) : a;
+  if (a < 0 || b < a || b - a >= MAX_EPISODES) return null;
+  return Array.from({ length: b - a + 1 }, (_, i) => a + i);
+}
+
+// Season/episode from a URL slug or file name: "show-1x18", "show-s01e18", "show-s02e36-e40", "show-2x36-40".
+function slugSE(text) {
+  const t = String(text || "").toLowerCase();
+  let m = /(?:^|[^a-z0-9])s(\d{1,3})[ ._-]?e(\d{1,4})(?:[-_]?e?(\d{1,4}))?(?![0-9])/.exec(t);
+  if (!m) m = /(?:^|[^0-9])(\d{1,3})x(\d{1,4})(?:-(\d{1,4}))?(?![0-9])/.exec(t);
+  if (!m) return null;
+  // A trailing number that isn't a sane range ("1x18-720p") is ignored rather than failing the whole match.
+  const eps = (m[3] && parseEpisodes(`${m[2]}-${m[3]}`)) || parseEpisodes(m[2]);
+  return eps ? { season: Number(m[1]), episodes: eps } : null;
+}
+
+// "tmdb:22586" | "tvdb:174681" | "imdb:tt0110943" | "22586" | a Seerr/TMDB/TVDB link -> { source, id }
+function parseLibraryId(type, raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  let m;
+  if ((m = /^(tmdb|tvdb):\s*(\d+)$/i.exec(s))) return { source: m[1].toLowerCase(), id: Number(m[2]) };
+  if ((m = /^imdb:\s*(tt\d+)$/i.exec(s)) || (m = /^(tt\d{5,})$/i.exec(s))) return { source: "imdb", id: m[1].toLowerCase() };
+  if (/^\d+$/.test(s)) return { source: type === "movie" ? "tmdb" : "tvdb", id: Number(s) };
+  try {
+    const u = new URL(s);
+    if ((m = /\/(movie|tv)\/(\d+)/.exec(u.pathname))) {           // Seerr and themoviedb.org links use TMDB ids
+      if ((m[1] === "movie") !== (type === "movie")) return { error: `that link is a ${m[1] === "tv" ? "series" : "movie"}` };
+      return { source: "tmdb", id: Number(m[2]) };
+    }
+    if (/thetvdb\.com$/.test(u.hostname) && (m = /[?&]id=(\d+)/.exec(u.search))) return { source: "tvdb", id: Number(m[1]) };
+    if ((m = /\/title\/(tt\d+)/.exec(u.pathname))) return { source: "imdb", id: m[1] };
+  } catch {}
+  return { error: "unrecognised id (use tmdb:123, tvdb:123, imdb:tt123 or a Seerr/TMDB link)" };
+}
+
+// Validates the library part of a request for one job. slugText = URL slug or file name, used for season/episode.
+function cleanLibrary(l, slugText) {
+  if (!LIBRARY || !l || !["movie", "series"].includes(l.type)) return { value: null };
+  const ref = parseLibraryId(l.type, l.id);
+  if (!ref) return { error: "library target needs an id" };
+  if (ref.error) return { error: ref.error };
+  const value = { type: l.type, idSource: ref.source, id: ref.id, language: LANGS.includes(l.language) ? l.language : "bul" };
+  if (l.type === "series") {
+    const fromSlug = slugSE(slugText);
+    const season = String(l.season ?? "").trim() !== "" ? Number(l.season) : fromSlug?.season;
+    const episodes = String(l.episode ?? "").trim() !== "" ? parseEpisodes(l.episode) : fromSlug?.episodes;
+    if (!Number.isInteger(season) || season < 0) return { error: "no season (not in the URL; set it in Library)" };
+    if (!episodes) return { error: "no episode (not in the URL; set it in Library)" };
+    Object.assign(value, { season, episodes });
+  }
+  return { value };
+}
+
+const libraryLabel = (l) => !l ? "" : l.type === "movie" ? `movie ${l.idSource}:${l.id}`
+  : `series ${l.idSource}:${l.id} S${String(l.season).padStart(2, "0")}E${l.episodes.map((e) => String(e).padStart(2, "0")).join("-E")}`;
+
+// Written only after a successful download, atomically, so an importer never sees a half-finished file.
+async function writeSidecar(j) {
+  if (!LIBRARY || !j.library) return;
+  if (!j.file) { j.log.push("!!! library target set, but the downloaded file wasn't found: no sidecar written"); return; }
+  const p = path.join(DOWNLOADS_DIR, j.file.replace(/\.[^.]+$/, "") + ".hlsgrab.json");
+  const data = { version: 1, file: j.file, ...j.library, sourceUrl: j.url, jobId: j.id, finishedAt: j.finishedAt };
+  await fsp.writeFile(p + ".tmp", JSON.stringify(data, null, 2) + "\n");
+  await fsp.rename(p + ".tmp", p);
+  j.log.push(`--> library sidecar: ${path.basename(p)} (${libraryLabel(j.library)})`);
+}
 
 function newJob(fields) {
   return { id: randomUUID(), status: "queued", createdAt: Date.now(), log: [], progress: null, ...fields };
@@ -142,7 +223,10 @@ function startJob(j) {
     else if (j.cancelRequested) j.status = "cancelled";
     else if (code === 0) { j.status = "done"; j.progress = j.progress && { ...j.progress, percent: 100 }; }
     else { j.status = "failed"; j.error = j.lastError || (signal ? `killed by ${signal}` : `exit code ${code}`); }
-    if (j.status === "done") j.file = await findOutputFile(j).catch(() => null);
+    if (j.status === "done") {
+      j.file = await findOutputFile(j).catch(() => null);
+      await writeSidecar(j).catch((e) => j.log.push(`!!! cannot write library sidecar: ${e.message}`));
+    }
     save();
     pump();
   });
@@ -189,7 +273,7 @@ function probe(url, timeout) {
 }
 
 // ---------------- files ----------------
-const isTempFile = (f) => /\.part(\.mp4)?$|\.ytdl$|\.temp(\.|$)|\.part-Frag\d+|^\./i.test(f);
+const isTempFile = (f) => /\.part(\.mp4)?$|\.ytdl$|\.temp(\.|$)|\.part-Frag\d+|^\.|\.hlsgrab\.json(\.tmp)?$/i.test(f);
 const MIME = { mp4: "video/mp4", mkv: "video/x-matroska", webm: "video/webm", ts: "video/mp2t", m4a: "audio/mp4", mp3: "audio/mpeg", vtt: "text/vtt", srt: "text/plain" };
 
 async function listFiles() {
@@ -255,16 +339,22 @@ function authorized(req) {
 function addJobs(body) {
   const options = cleanOptions(body.options);
   const created = [], rejected = [];
+  const slugOf = (u) => { try { return new URL(u).pathname.split("/").filter(Boolean).pop() || ""; } catch { return ""; } };
   if (body.mode === "direct") {
     const url = String(body.url || "").trim();
-    if (!isHttpUrl(url)) return { created, rejected: [url || "(empty)"] };
-    created.push(newJob({ kind: "direct", url, referer: String(body.referer || "").trim(), name: cleanName(body.name), options }));
+    if (!isHttpUrl(url)) return { created, rejected: [`${url || "(empty)"}: not an http(s) URL`] };
+    const name = cleanName(body.name);
+    const lib = cleanLibrary(body.library, name);
+    if (lib.error) return { created, rejected: [`${name || url}: ${lib.error}`] };
+    created.push(newJob({ kind: "direct", url, referer: String(body.referer || "").trim(), name, options, library: lib.value }));
   } else {
     for (let line of String(body.urls || "").split(/\r?\n/)) {
       line = line.trim();
       if (!line || line.startsWith("#")) continue;
-      if (isHttpUrl(line)) created.push(newJob({ kind: "page", url: line, options }));
-      else rejected.push(line);
+      if (!isHttpUrl(line)) { rejected.push(`${line}: not an http(s) URL`); continue; }
+      const lib = cleanLibrary(body.library, slugOf(line));
+      if (lib.error) { rejected.push(`${line}: ${lib.error}`); continue; }
+      created.push(newJob({ kind: "page", url: line, options, library: lib.value }));
     }
   }
   state.jobs.push(...created);
@@ -288,7 +378,7 @@ const server = http.createServer(async (req, res) => {
       return fs.createReadStream(INDEX_HTML).pipe(res);
     }
     if (req.method === "GET" && p === "/api/state") {
-      return send(res, 200, { paused: state.paused, concurrency: CONCURRENCY, downloadsDir: DOWNLOADS_DIR, jobs: state.jobs.map(summary) });
+      return send(res, 200, { paused: state.paused, concurrency: CONCURRENCY, downloadsDir: DOWNLOADS_DIR, library: LIBRARY, jobs: state.jobs.map(summary) });
     }
     if (req.method === "POST" && p === "/api/jobs") return send(res, 200, addJobs(await readJson(req)));
     if (req.method === "POST" && p === "/api/queue") {
@@ -362,6 +452,6 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
 }
 
 server.listen(PORT, HOST, () => {
-  console.log(`hlsgrab listening on http://${HOST}:${PORT}  downloads: ${DOWNLOADS_DIR}  data: ${DATA_DIR}${AUTH ? "  (basic auth on)" : ""}`);
+  console.log(`hlsgrab listening on http://${HOST}:${PORT}  downloads: ${DOWNLOADS_DIR}  data: ${DATA_DIR}${AUTH ? "  (basic auth on)" : ""}${LIBRARY ? "  (library sidecars on)" : ""}`);
   pump();
 });
