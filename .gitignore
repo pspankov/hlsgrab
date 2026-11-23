@@ -1,0 +1,6 @@
+data/
+downloads/
+node_modules/
+*.part
+*.part.mp4
+.env

@@ -1,0 +1,19 @@
+services:
+  hlsgrab:
+    build: .
+    image: hlsgrab:latest
+    container_name: hlsgrab
+    init: true                 # reaps Chrome/ffmpeg child processes
+    restart: unless-stopped
+    shm_size: 1gb              # Chrome needs more than Docker's default 64 MB
+    stop_grace_period: 15s     # lets running jobs stop cleanly and go back to the queue
+    ports:
+      - "8090:8090"
+    environment:
+      DOWNLOADS_DIR: /downloads
+      DATA_DIR: /data
+      CONCURRENCY: "1"         # downloads at a time
+      AUTH: ${HLSGRAB_AUTH:-}  # "user:password" to require a login; empty = no login
+    volumes:
+      - ./downloads:/downloads
+      - ./data:/data
