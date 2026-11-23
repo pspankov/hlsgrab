@@ -113,7 +113,9 @@ let resolveFirst;
 const firstFound = new Promise((r) => (resolveFirst = r));
 
 const record = (requestId, url, headers, frameUrl, method) => {
-  if (found.has(url)) return;
+  // The same playlist URL requested again (players reload it): map the new request to the existing result,
+  // so its ExtraInfo headers and body still have somewhere to go.
+  if (found.has(url)) { byRequestId.set(requestId, found.get(url)); return; }
   const r = {
     url,
     method: method ?? null,
@@ -220,6 +222,7 @@ ws.onmessage = async (ev) => {
 
 function applyExtra(requestId, headers) {
   const r = byRequestId.get(requestId);
+  if (!r) return;
   r.referer = getHeader(headers, "referer") ?? r.referer;
   r.origin = getHeader(headers, "origin") ?? r.origin;
   r.userAgent = getHeader(headers, "user-agent") ?? r.userAgent;
