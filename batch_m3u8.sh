@@ -286,13 +286,68 @@ pick_tool() {
 # Each dead host is mapped to a live host that is verified to serve that same segment path. If any host was
 # rerouted, the fixed playlist is served from a throwaway local HTTP server: ffmpeg drops -headers/-user_agent
 # for segments when the playlist is a local file, but keeps them when the playlist itself comes over HTTP.
+#
+# Wrapped segments: some hosts serve each MPEG-TS segment behind a small image header (e.g. a valid 70-byte 1x1
+# PNG, so the segment can live on an image CDN). Downloaders save those bytes as they are, and the result is a
+# "video" of PNG frames. The first segment is checked; if the TS data starts after a prefix, a local proxy
+# serves the playlist and strips the prefix from every segment, and ffmpeg downloads through it (stream copy).
 host_check=1
-HC_DIR=""; HC_SRV=""; HC_INPUT=""; HC_DEAD=0; HC_EXTS=""; HC_UA=""; HC_REF=""
+HC_DIR=""; HC_SRV=""; HC_INPUT=""; HC_DEAD=0; HC_EXTS=""; HC_UA=""; HC_REF=""; HC_WRAP=0
 hc_cleanup() {
   [[ -n $HC_SRV ]] && kill "$HC_SRV" 2>/dev/null
   [[ -n $HC_DIR ]] && rm -rf "$HC_DIR"
   HC_SRV=""; HC_DIR=""
 }
+
+# Offset of the first run of 5 MPEG-TS packets (0x47 every 188 bytes) in a file; -1 if none in the first 64 KB.
+TS_START_PY='
+import sys
+d = open(sys.argv[1], "rb").read(65536 + 5 * 188)
+print(next((i for i in range(min(len(d), 65536)) if all(i + k * 188 < len(d) and d[i + k * 188] == 0x47 for k in range(5))), -1))'
+
+# Local proxy for wrapped segments: serves /playlist.m3u8 (segment URIs rewritten to /seg/<n>.ts); each segment
+# is fetched with the stream's Referer + User-Agent and returned from its first TS packet on.
+UNWRAP_PY='
+import http.server, re, sys, urllib.request
+src, ua, ref, portfile = sys.argv[1:5]
+segs, out = [], []
+for line in open(src).read().splitlines():
+    if line and not line.startswith("#"):
+        out.append(f"/seg/{len(segs)}.ts"); segs.append(line)
+    else:
+        out.append(line)
+playlist = ("\n".join(out) + "\n").encode()
+def ts_start(d):
+    for i in range(min(len(d), 65536)):
+        if all(i + k * 188 < len(d) and d[i + k * 188] == 0x47 for k in range(5)):
+            return i
+    return -1
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path == "/playlist.m3u8":
+            body, ctype = playlist, "application/vnd.apple.mpegurl"
+        else:
+            m = re.fullmatch(r"/seg/(\d+)\.ts", self.path)
+            if not m or int(m[1]) >= len(segs):
+                return self.send_error(404)
+            hdr = {"User-Agent": ua, **({"Referer": ref} if ref else {})}
+            try:
+                d = urllib.request.urlopen(urllib.request.Request(segs[int(m[1])], headers=hdr), timeout=60).read()
+            except Exception as e:
+                return self.send_error(502, str(e)[:120])
+            off = ts_start(d)
+            if off < 0:
+                return self.send_error(502, "no MPEG-TS data in segment")
+            body, ctype = d[off:], "video/mp2t"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+open(portfile, "w").write(str(s.server_port))
+s.serve_forever()'
 hc_curl() { curl -sfL -m 20 -A "$HC_UA" ${HC_REF:+-e "$HC_REF"} "$@"; }
 
 ABS_AWK='
@@ -321,7 +376,7 @@ hc_probe() { # <url> -> prints HTTP status (000 = unreachable)
 #   returns 0 = checked (HC_DEAD rerouted hosts; HC_INPUT = playlist to use), 1 = no live host at all,
 #           2 = check not possible (skipped; download the original URL as before)
 check_hosts() {
-  HC_INPUT=$1; HC_REF=$2; HC_UA=$3; HC_DEAD=0; HC_EXTS=""
+  HC_INPUT=$1; HC_REF=$2; HC_UA=$3; HC_DEAD=0; HC_EXTS=""; HC_WRAP=0
   local w media total good dead_n
   command -v curl >/dev/null && command -v python3 >/dev/null || { echo "--> hosts:   check skipped (needs curl + python3)" >&2; return 2; }
   HC_DIR=$(mktemp -d); w=$HC_DIR
@@ -347,6 +402,16 @@ check_hosts() {
   awk '!/^#/' "$w/media.abs" > "$w/segs"
   [[ -s $w/segs ]] || { echo "--> hosts:   check skipped (no segments in playlist)" >&2; return 2; }
 
+  # wrapped segments? (TS data that doesn't start at byte 0; encrypted streams are left alone)
+  local off
+  if ! grep -qE '^#EXT-X-KEY:.*METHOD=(AES|SAMPLE)' "$w/media.abs" && hc_curl -r 0-65535 "$(head -n 1 "$w/segs")" -o "$w/seg0"; then
+    off=$(python3 -c "$TS_START_PY" "$w/seg0" 2>/dev/null)
+    if [[ $off =~ ^[0-9]+$ ]] && (( off > 0 )); then
+      HC_WRAP=1
+      echo "--> segments: wrapped ($(head -c 4 "$w/seg0" | tr -dc '[:alnum:]' | head -c 4 || true) header, TS data from byte $off): stripping it via a local proxy" >&2
+    fi
+  fi
+
   # one sample segment per host, probed in parallel
   awk -F/ '!seen[$3]++ { print $3 " " $0 }' "$w/segs" > "$w/samples"
   total=$(wc -l < "$w/samples")
@@ -360,36 +425,42 @@ check_hosts() {
   if [[ ! -s $w/good ]]; then
     echo "!!! hosts:   none of $total segment hosts is reachable" >&2; return 1
   fi
-  if (( dead_n == 0 )); then
-    echo "--> hosts:   $total segment host(s), all reachable" >&2; return 0
-  fi
-
-  # map each dead host to a live host that really serves the same path (try up to 8 live hosts)
   : > "$w/map"
-  local h u code g cand unfixed=0
-  while read -r _ h code; do
-    u=$(awk -v h="$h" '$1 == h { print $2; exit }' "$w/samples")
-    g=""
-    while read -r cand; do
-      [[ $(hc_probe "${u/:\/\/$h\//:\/\/$cand\/}") == 2?? ]] && { g=$cand; break; }
-    done < <(head -n 8 "$w/good")
-    if [[ -n $g ]]; then echo "$h $g" >> "$w/map"; echo "--> hosts:   $h ($code) -> $g" >&2
-    else unfixed=$((unfixed + 1)); echo "--> hosts:   $h ($code) -> no live host serves its segments, left as is" >&2; fi
-  done < <(awk '$1 == "dead"' "$w/probe")
-  HC_DEAD=$(wc -l < "$w/map")
-  echo "--> hosts:   $total total, $dead_n dead, $HC_DEAD rerouted$( (( unfixed )) && echo ", $unfixed unfixable")" >&2
-  (( HC_DEAD )) || return 0
+  if (( dead_n == 0 )); then
+    echo "--> hosts:   $total segment host(s), all reachable" >&2
+  else
+    # map each dead host to a live host that really serves the same path (try up to 8 live hosts)
+    local h u code g cand unfixed=0
+    while read -r _ h code; do
+      u=$(awk -v h="$h" '$1 == h { print $2; exit }' "$w/samples")
+      g=""
+      while read -r cand; do
+        [[ $(hc_probe "${u/:\/\/$h\//:\/\/$cand\/}") == 2?? ]] && { g=$cand; break; }
+      done < <(head -n 8 "$w/good")
+      if [[ -n $g ]]; then echo "$h $g" >> "$w/map"; echo "--> hosts:   $h ($code) -> $g" >&2
+      else unfixed=$((unfixed + 1)); echo "--> hosts:   $h ($code) -> no live host serves its segments, left as is" >&2; fi
+    done < <(awk '$1 == "dead"' "$w/probe")
+    HC_DEAD=$(wc -l < "$w/map")
+    echo "--> hosts:   $total total, $dead_n dead, $HC_DEAD rerouted$( (( unfixed )) && echo ", $unfixed unfixable")" >&2
+  fi
+  (( HC_DEAD || HC_WRAP )) || return 0
 
   mkdir -p "$w/srv"
-  awk 'NR == FNR { m[$1] = $2; next }
+  # FILENAME, not NR == FNR: the map is empty when no host was rerouted (wrapped-only), and NR == FNR would
+  # then swallow the whole playlist as map entries.
+  awk 'FILENAME == ARGV[1] { m[$1] = $2; next }
        { for (d in m) { k = "://" d "/"; while ((i = index($0, k)) > 0) $0 = substr($0, 1, i - 1) "://" m[d] "/" substr($0, i + length(k)) } print }' \
     "$w/map" "$w/media.abs" > "$w/srv/playlist.m3u8"
   HC_EXTS=$(awk '!/^#/ { sub(/[?#].*/, ""); n = split($0, p, "/"); if (match(p[n], /\.[A-Za-z0-9]+$/)) print substr(p[n], RSTART + 1) }' "$w/srv/playlist.m3u8" | sort -u | paste -sd,)
+  if (( HC_WRAP )); then
+    python3 -c "$UNWRAP_PY" "$w/srv/playlist.m3u8" "$HC_UA" "$HC_REF" "$w/port" </dev/null >/dev/null 2>&1 &
+  else
   python3 -c 'import http.server, sys, functools
 class Q(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
 s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Q, directory=sys.argv[1]))
 open(sys.argv[2], "w").write(str(s.server_port)); s.serve_forever()' "$w/srv" "$w/port" </dev/null >/dev/null 2>&1 &
+  fi
   HC_SRV=$!
   local i; for i in {1..50}; do [[ -s $w/port ]] && break; sleep 0.1; done
   [[ -s $w/port ]] || { echo "!!! hosts:   could not start local playlist server" >&2; return 1; }
@@ -406,9 +477,9 @@ download() {
   if (( host_check )) && [[ $tool == ffmpeg || $downloader == auto ]]; then
     check_hosts "$url" "$ref" "$ua"; rc=$?
     if (( rc == 1 )); then hc_cleanup; return 1; fi
-    if (( rc == 0 && HC_DEAD > 0 )); then
+    if (( rc == 0 && (HC_DEAD > 0 || HC_WRAP) )); then
       input=$HC_INPUT; [[ -n $HC_EXTS ]] && exts+=",$HC_EXTS"
-      if [[ $tool == yt-dlp ]]; then echo "--> switching to ffmpeg to use the rerouted playlist" >&2; tool=ffmpeg; fi
+      if [[ $tool == yt-dlp ]]; then echo "--> switching to ffmpeg to use the $( (( HC_WRAP )) && echo unwrapping proxy || echo rerouted playlist)" >&2; tool=ffmpeg; fi
     fi
   fi
   command -v "$tool" >/dev/null || { echo "missing dependency: $tool" >&2; hc_cleanup; return 2; }
